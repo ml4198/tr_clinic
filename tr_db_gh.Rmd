@@ -1,0 +1,1445 @@
+---
+title: "tr_db_gh"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(patchwork)
+library(survival)
+library(survminer)
+library(lubridate)
+library(My.stepwise)
+library(rms)
+library(modelr)
+library(missRanger)
+library(nnet)
+library(patchwork)
+library(gridExtra)
+library(mice)
+library(caret)
+library(e1071)
+library(mlbench)
+#library(ROCR)
+library(rminer)
+library(glmnet)
+library(pROC)
+
+library(riskscorer)
+
+tri_score <- function(
+    id,
+    age_above_70               = FALSE,
+    nyha_class_iii_iv          = FALSE,
+    right_heart_fail           = FALSE,
+    daily_dose_furosemide      = FALSE,
+    eGFR_less_30               = FALSE,
+    elevated_bilirubin         = FALSE,
+    left_ventricular_ejection  = FALSE,
+    mod_sev_ventricular_dysfun = FALSE
+    ){
+
+  score = 0
+  if(age_above_70)               { score=score+1 }
+  if(nyha_class_iii_iv)          { score=score+1 }
+  if(right_heart_fail)           { score=score+2 }
+  if(daily_dose_furosemide)      { score=score+2 }
+  if(eGFR_less_30)               { score=score+2 }
+  if(elevated_bilirubin)         { score=score+2 }
+  if(left_ventricular_ejection)  { score=score+1 }
+  if(mod_sev_ventricular_dysfun) { score=score+1 }
+
+  mortality = 0.01
+
+ if(score == 1){
+    mortality = 0.02
+  }else if(score == 2){
+    mortality = 0.03
+  }else if(score == 3){
+    mortality = 0.05
+  }else if(score == 4){
+    mortality = 0.08
+  }else if(score == 5){
+    mortality = 0.14
+  }else if(score == 6){
+    mortality = 0.22
+  }else if(score == 7){
+    mortality = 0.34
+  }else if(score == 8){
+    mortality = 0.48
+  }else if(score == 9){
+    mortality = 0.65
+  }else if(score == 10){
+    mortality = 0.65
+  }else if(score == 11){
+    mortality = 0.65
+  }else if(score == 12){
+    mortality = 0.65
+  }
+  return(
+    data.frame(
+      empi = id, ### Change this here to the same as your ID tag (on the left not the right)
+      #tri_score = score,
+      mortality = mortality
+    ))
+}
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+#import data
+empi_full =
+  read.csv("./empi_merged.csv") %>% 
+  mutate(
+    visit_date = as.Date(visit_date, "%m/%d/%y"), 
+    year = format(visit_date, "%Y"),
+    date_tte = as.Date(date_tte, tz="UTC"), 
+    year = format(date_tte, "%Y"),
+    date_rhc = as.Date(date_rhc, tz="UTC"), 
+    year = format(date_rhc, "%Y"),
+    date_hfh = as.Date(date_hfh, "%m/%d/%y"), 
+    year = format(date_hfh, "%Y"),
+    date_intervention = as.Date(date_intervention, "%m/%d/%y"), 
+    year = format(date_intervention, "%Y"),
+    other_proc_date = as.Date(other_proc_date, "%m/%d/%y"), 
+    year = format(other_proc_date, "%Y"),
+    last_alive = as.Date(last_alive, "%m/%d/%y"), 
+    year = format(last_alive, "%Y"),
+    date_death = as.Date(date_death, "%m/%d/%y"), 
+    year = format(date_death, "%Y"),
+    nyha_ordinal = nyha,
+    nyha_ordinal = recode(nyha_ordinal, `1` = "I", `2` = "II", `3` = "III", `4` = "IV"),
+    nyha = if_else(nyha > 2, 1, 0, 0),
+    stroke_volume=as.numeric(stroke_volume),
+    pvr = (papm-pcwp_mean)/fick_co,
+    tpg = (papm-pcwp_mean),
+    tapse_pasp = rv_tapse / pasp,
+    tapse_paps = rv_tapse / paps,
+    sprime_pasp = rv_tdi / pasp,
+    sprime_paps = rv_tdi / paps,
+    fac_pasp = rv_fac / pasp,
+    fac_paps = rv_fac/ paps,
+    papi = (paps - papd) / ra_mean,
+    vc_avg = rowMeans(select(., tr_inflow_vc, tr_4ch_vc, tr_any_vc), na.rm = TRUE),
+    meld = transplantr::meld_US(INR = inr, bili = tbili, creat = creatinine, dialysis = esrd),
+    race = tolower(race),
+    gender = tolower(gender),
+    race = if_else(race == "black", "black", "non-black", "non-black"), 
+    gender = if_else(gender == "male", 1, 0, 0),
+    egfr = transplantr::ckd_epi_US(creat = creatinine, age = age, sex = gender, eth = race),
+    avr = if_else(aortic == 1, 1, 0, 0),
+    tavr = if_else(aortic == 2, 1, 0, 0),
+    mvr = if_else(mitral == 1|mitral == 2, 1, 0, 0),
+    mitraclip = if_else(mitral == 3, 1, 0, 0),
+    tvr = if_else(tricuspid == 1|tricuspid == 2, 1, 0, 0),
+    prior_ttvi = if_else(tricuspid == 3, 1, 0, 0),
+    re_op = if_else(cabg == 1| aortic == 1|mitral == 1|mitral == 2|tricuspid == 1|tricuspid == 2, 1, 0, 0),
+    hx_hfh = if_else(hx_hfh == 1, 1, 0, 0),
+    prior_valve = if_else(prior_valve == 1, 1, 0, 0),
+    tricuspid_intervention = ifelse(is.na(tricuspid_intervention), 0, tricuspid_intervention),
+    type_intervention = ifelse(is.na(type_intervention), 0, type_intervention),
+    tr_cat = case_when(
+      tricuspid_regurg == "torrential"|vc_avg >= 2.1 | tr_pisa_eroa >= 0.80 | doppler_eroa >= 1.15 ~ "torrential",
+      tricuspid_regurg == "massive"|vc_avg >= 1.4 & vc_avg < 2.1 | tr_pisa_eroa >= 0.60 & tr_pisa_eroa < 0.80 | doppler_eroa >= 0.95 & doppler_eroa < 1.15 ~ "massive",
+      tricuspid_regurg == "severe"|tricuspid_regurg == "moderate to severe"|vc_avg >= 0.7 & vc_avg < 1.4 | tr_pisa_eroa >= 0.40 & tr_pisa_eroa < 0.60 | doppler_eroa >= 0.75 & doppler_eroa < 0.95 ~ "severe",
+      tricuspid_regurg == "moderate"|tricuspid_regurg == "mild to moderate"|tricuspid_regurg == "mild"|tricuspid_regurg == "trace"|vc_avg < 0.7|tr_pisa_eroa < 0.40|doppler_eroa < 0.75 ~ "≤moderate"
+      ),
+    tr_cat = fct_relevel(tr_cat, "≤moderate", "severe", "massive", "torrential"),
+    tricuspid_regurg = fct_relevel(tricuspid_regurg, "trace", "mild", "mild to moderate", "moderate", "moderate to severe", "severe", "massive", "torrential"),
+    cvp_cat = if_else(ra_mean >= 13, 1, 0),
+    cvp_tert = case_when(
+      ra_mean > 15 ~ 3,
+      ra_mean > 10 ~ 2,
+      ra_mean <= 10 ~ 1),
+    cvp_quart = case_when(
+      ra_mean > 17 ~ 4,
+      ra_mean > 13 ~ 3,
+      ra_mean > 8 ~ 2,
+      ra_mean <= 8 ~ 1),
+    cvp_high = if_else(cvp_tert == 3, 1, 0),
+    cvp_med = if_else(cvp_tert == 2, 1, 0), 
+    pa_cat = case_when(
+      paps <50 ~ 1, 
+      paps >=50 & pasp >= 50 ~ 2,
+      paps >=50 & pasp < 50 ~ 3,
+      missing = NULL),
+    pa_concordant = if_else(pa_cat == 2, 1, 0),
+    pa_discordant = if_else(pa_cat == 3, 1, 0),
+    any_proc = if_else(tricuspid_intervention==1|other_proc_valve==1, 1, 0, 0),
+    other_valve_date = if_else(other_proc_valve == 1, other_proc_date, NA_real_),
+    any_proc_date = pmin(date_intervention, other_valve_date, na.rm=TRUE)
+  ) %>% 
+  drop_na(visit_date)
+
+#mutate variables to input for triscore and euroscore 2
+empi_risk_scores=
+  empi_full %>% 
+  select(empi, age, egfr, tbili, lvef_calc, rv_tapse, rv_tdi, gender, esrd, paps, pasp, nyha, nyha_ordinal, re_op, pad, lung_dz) %>% 
+  mutate(
+    #tri_score variables
+    age_above_70 = if_else(age>70, TRUE, FALSE),
+    #right_heart_fail = FALSE,
+    #daily_dose_furosemide = FALSE,
+    eGFR_less_30 = if_else(egfr<30|esrd==1, TRUE, FALSE),
+    elevated_bilirubin = if_else(tbili>1.3, TRUE, FALSE),
+    left_ventricular_ejection = if_else(lvef_calc<60, TRUE, FALSE),
+    mod_sev_ventricular_dysfun = if_else(rv_tapse<17|rv_tdi<9.5, TRUE, FALSE),
+    #euroscore II variables
+    gender_es2 = if_else(gender == 1, 0, 1),
+    renal_dysfunc = case_when(esrd == 1 ~ 'dialysis', egfr >85 ~ 'gt_85', egfr >= 50 & egfr <= 85 ~ '50_85', egfr <50 ~ 'lt_50'),
+    lv_fun = case_when(lvef_calc > 50 ~ 'gt_50', lvef_calc >30 & lvef_calc <= 50 ~ '31_50', lvef_calc >20 & lvef_calc <= 30 ~ '21_30', lvef_calc < 20 ~ 'lt_20'),
+    sPAP = case_when(paps>55|pasp>55~'gt_55', (paps>30&paps<=55)|(pasp>30&pasp<=55) ~ '31_55', paps<31|pasp<31 ~ 'lt_31'),
+    proc_weight = 'single-non-CABG'
+  ) %>% 
+   replace(is.na(.), FALSE)
+
+empi_full$es2 <- map(1:nrow(empi_risk_scores), function(i)
+   es_II(
+    age = empi_risk_scores[i,]$age,
+    female = empi_risk_scores[i,]$gender_es2,
+    proc_weight = empi_risk_scores[i,]$proc_weight,
+    NYHA = empi_risk_scores[i,]$nyha_ordinal,
+    ECA = empi_risk_scores[i,]$pad,
+    CPD = empi_risk_scores[i,]$lung_dz,
+    redo = empi_risk_scores[i,]$re_op,
+    renal_dysfunc = empi_risk_scores[i,]$renal_dysfunc,
+    sPAP = empi_risk_scores[i,]$sPAP,
+    lv_func = empi_risk_scores[i,]$lv_fun
+  )
+)
+
+empi_full$es2 =
+empi_full$es2 %>% unlist()
+
+triscore <- map_dfr(1:nrow(empi_risk_scores), function(i)
+  tri_score(
+    empi_risk_scores[i,]$empi,
+    empi_risk_scores[i,]$age_above_70, 
+    empi_risk_scores[i,]$nyha,
+    FALSE,
+    FALSE,
+    empi_risk_scores[i,]$eGFR_less_30,
+    empi_risk_scores[i,]$elevated_bilirubin,
+    empi_risk_scores[i,]$left_ventricular_ejection,
+    empi_risk_scores[i,]$mod_sev_ventricular_dysfun
+  )
+)
+
+empi_full =
+full_join(empi_full, triscore, by="empi") %>% 
+  rename(triscore=mortality)
+  
+#add in echo variables
+empi_tte =
+  read.csv("./empi_tte.csv") %>% 
+  select(empi, papm_echo, pvr_echo, lvot_sv, rvot_sv, tr_velocity, aortic_regurg, mitral_stenosis)
+
+empi_full = 
+  left_join(empi_full, empi_tte, by = "empi")
+
+empi_full = 
+  empi_full %>% 
+  mutate(
+    aortic_stenosis = str_to_lower(aortic_stenosis),
+    aortic_regurg = str_to_lower(aortic_regurg),
+    mitral_stenosis = str_to_lower(mitral_stenosis),
+    mitral_regurg = str_to_lower(mitral_regurg),
+    aortic_stenosis = if_else(str_detect(aortic_stenosis, "^moderate$|^moderate to severe$|^severe$|critical"), 1, 0, 0),
+    aortic_regurg = if_else(str_detect(aortic_regurg, "^moderate$|^moderate to severe$|^severe$"), 1, 0, 0),
+    mitral_stenosis = if_else(str_detect(mitral_stenosis, "^moderate$|^moderate to severe$|^severe$"), 1, 0, 0), 
+    mitral_regurg = if_else(str_detect(mitral_regurg, "^moderate$|^moderate to severe$|^severe$"), 1, 0, 0),
+    aortic_valve = if_else(aortic_stenosis==1|aortic_regurg==1, 1, 0, 0),
+    mitral_valve = if_else(mitral_stenosis==1|mitral_regurg==1, 1, 0, 0),
+    left_valve = if_else(aortic_valve==1|mitral_valve==1, 1, 0, 0)
+    )
+
+tr_filtered =
+empi_full %>% 
+  filter(tr_cat != "NA")
+```
+
+# STS Scores
+```{r}
+var_interest <- empi_full %>% 
+  dplyr::select(
+    empi,        # id 
+    age,         # continuous
+    gender,      # binary
+    creatinine,  # continuous
+    esrd,        # binary (dialysis)
+    liver_dz,    # binary
+    cad,         # binary
+    pci,         # binary
+    nyha_ordinal,    # categorical  
+    atrial_fib,      # binary
+    lvef_calc,       # continuous, (ejection fraction)
+    aortic_stenosis, # binary
+    re_op,           # binary (incidence, first incidence if re_op = 1)
+) 
+
+
+var_ordering <- var_interest %>% 
+  relocate(empi, age, creatinine, lvef_calc, nyha_ordinal) %>%
+  arrange(
+    re_op,           # binary (incidence, first incidence if re_op = 1)
+    aortic_stenosis,
+    atrial_fib,      # binary
+    pci,         # binary
+    cad,         # binary
+    liver_dz,    # binary
+    esrd,        # binary (dialysis)
+    gender,      # binary
+    nyha_ordinal,    # categorical  
+    age,
+    creatinine,
+    lvef_calc,
+) 
+id_order <- var_ordering %>% pull(empi)
+#write.csv(var_ordering, "sts_scores.csv")
+
+```
+
+# Multivariable Logistic Regression Analysis for Outcome of Operative Mortality
+```{r}
+var_interest <- empi_full %>% 
+  dplyr::select(
+    empi,         # id 
+    age,          # continuous
+    gender,       # binary
+    stroke,       # binary
+    esrd,         # binary Hemodialysis
+    lung_dz,      # binary, (1=moderate)
+    nyha_ordinal, # categorical  
+    re_op,        # binary (incidence, first incidence if re_op = 1)
+) 
+
+```
+
+Model from the paper: 
+
+$$
+\begin{aligned}
+logit(E[Y]) &= \beta_0 + \beta_1I(\textrm{Age}_{60-69})+ \beta_2I(\textrm{Age}_{70+}) \\
+&+ \beta_3 I(\textrm{Female}) + \beta_4 I(\textrm{Hemodialysis}) \\
+&+ \beta_5 I(\textrm{lung_dz}_{\textrm{moderate}}) + \beta_6 I(\textrm{lung_dz}_{\textrm{severe}}) \\
+& + \beta_7I(\textrm{NYHA}_{III})+ \beta_8I(\textrm{NYHA}_{IV})\\
+&+ \beta_9 I(\textrm{RE_OP}) + \beta_{10} I(\textrm{Status})
+\end{aligned}
+$$
+Where less than 40, no lung disease and classes I/II are the reference groups for the categorical variables. 
+
+```{r}
+### Re code the variables 
+df_var <- var_interest %>% 
+  mutate(
+    age_40below = ifelse(age < 40, 1, 0),
+    age_60_69 = ifelse(age < 70 & age > 59,1,0 ),
+    age_70plus = ifelse(age > 69, 1, 0),
+    nyha_ordinal = ifelse(is.na(nyha_ordinal), 0, nyha_ordinal),
+    nyha_iii = ifelse(nyha_ordinal == "III", 1, 0),
+    nyha_iv = ifelse(nyha_ordinal == "IV", 1, 0),
+  )
+
+# model 
+df_temp <- df_var %>% mutate(
+  score = log(0.009)+ log(2.26)*df_var$age_60_69 + log(3.27)*df_var$age_70plus +
+  log(1.41)*df_var$gender + log(2.03)*df_var$stroke + log(3.34)*df_var$esrd +
+  log(1.56)*df_var$lung_dz + log(2.05)*df_var$nyha_iii + log(3.33)*df_var$nyha_iv +
+  log(1.59)*df_var$nyha_iv,
+  tvs_risk = exp(score) /(1+ exp(score))
+) %>% select(empi, tvs_risk)
+```
+
+# Join results and Comparing 
+```{r}
+empi_full <- full_join(empi_full,df_temp, by="empi")
+empi_full$tvs_risk
+```
+
+#MELD-XI and MELD-albumin scores
+```{r}
+empi_full=
+empi_full %>% 
+  mutate(
+    creat_meld_xi = case_when(
+      esrd==1|creatinine>4 ~ 4,
+      creatinine < 1 ~ 1,
+      TRUE ~ creatinine
+      ),
+    bili_meld_xi = if_else(tbili<1, 1, tbili),
+    meld_xi = 5.112*log(bili_meld_xi) + 11.76*log(creat_meld_xi) + 9.44,
+    alb_meld = case_when(
+      albumin>4~4,
+      albumin<1~1,
+      TRUE~albumin),
+    meld_albumin = meld + (6.179*(4-alb_meld) - 0.163*meld*(4-alb_meld))
+  )
+```
+
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+## Summary data by TR severity
+empi_full %>% 
+  summarise(
+  n = n_distinct(empi)
+) %>% 
+  knitr::kable()
+
+empi_full %>% 
+  group_by(tricuspid_regurg) %>% 
+  summarise(
+    n = n()
+  ) %>%
+  mutate(prop = prop.table(n)) %>% 
+  knitr::kable()
+
+empi_full %>% 
+  filter(tr_cat != "NA") %>% 
+  group_by(tr_cat) %>% 
+  summarise(
+    n = n()
+  ) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  knitr::kable()
+
+empi_full %>% 
+  #group_by(tr_cat) %>% 
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    iqr_age = IQR(age, na.rm = TRUE)
+  ) %>% 
+  knitr::kable()
+
+empi_full %>% 
+  mutate(gender = as.character(gender), gender = recode(gender, "0" =  "female", "1" = "male")) %>% 
+  pivot_longer(gender, names_to = "variable", values_to = "data") %>% #substitute gender:ethnicity for race/ethnicity, but too much missing data
+  drop_na(data) %>%
+  group_by(variable, tr_cat, data) %>% #added tr_cat
+  summarise(
+    n = n()) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  knitr::kable()
+
+empi_full %>% #baseline characteristics
+  #filter(tricuspid_intervention == 0) %>% #med rx eval
+  select(tr_cat, nyha:prior_valve, avr, tavr, mvr, mitraclip, tvr, prior_ttvi, re_op, aortic_stenosis, mitral_regurg) %>% 
+  pivot_longer(nyha:mitral_regurg, names_to = "variable", values_to = "data") %>% 
+  drop_na(data) %>% #drop tr_cat for med rx eval
+  group_by(variable) %>%
+  summarise(
+    n = n(), 
+    sum= sum(data)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+empi_full %>% ##chi-square for parametric
+  select(gender, nyha, hx_hfh, htn, diabetes, atrial_fib, lung_dz, cied, cabg, prior_valve, mvr, re_op) %>% 
+  map(~chisq.test(.x, empi_full$tr_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+empi_full %>% ##fisher for non-parametric
+  select(stroke, esrd, liver_dz, pci, avr, tavr, mitraclip, tvr, prior_ttvi) %>% 
+  map(~fisher.test(.x, empi_full$tr_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+tr_filtered %>% #echo variables
+  select(tr_cat, aortic_stenosis,mitral_regurg,left_valve) %>% 
+  pivot_longer(aortic_stenosis:left_valve, names_to = "variable", values_to = "data") %>% 
+  group_by(variable, tr_cat) %>% 
+  summarise(
+    n = n(), 
+    sum= sum(data)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+tr_filtered %>% #echo variables chisq pvalues
+  select(aortic_stenosis,mitral_regurg,left_valve) %>% 
+  map(~chisq.test(.x, tr_filtered$tr_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+##procedural outcomes
+#total TV procedures
+empi_full %>% 
+  mutate(tricuspid_intervention = if_else(tricuspid_intervention == 1, 1, 0, 0 )) %>% 
+  summarise(
+    n = n(), 
+    sum = sum(tricuspid_intervention)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+#TV procedures: ttvi vs surgery
+empi_full %>% 
+  mutate(tricuspid_intervention = if_else(tricuspid_intervention == 1, 1, 0, 0 )) %>% 
+  filter(tricuspid_intervention == 1) %>% 
+  group_by (type_intervention) %>% 
+  summarise(
+    n = n()
+    ) %>% 
+  knitr::kable()
+
+#TV procedures: multivalvular procedure, stratified by TTVI vs surgery
+empi_full %>% 
+  mutate(tricuspid_intervention = if_else(tricuspid_intervention == 1, 1, 0, 0 )) %>% 
+  filter(tricuspid_intervention == 1) %>% 
+  group_by(type_intervention) %>% 
+  summarise(
+    n = n(), 
+    sum = sum(concomitant_valve, na.rm=TRUE)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+#TV procedures: sequential procedures (TV following other valve intervention)
+empi_full %>% 
+  mutate(
+    tricuspid_intervention = if_else(tricuspid_intervention == 1, 1, 0, 0 ),
+    sequential_tv = if_else(date_intervention>other_proc_date, 1, 0, 0)
+    ) %>% 
+  filter(
+    tricuspid_intervention == 1,
+    other_proc_valve == 1
+    ) %>% 
+  group_by(type_intervention) %>% 
+  summarise(
+    total = n(),
+    n_sequential_tv = sum(sequential_tv, na.rm=TRUE)
+    ) %>%
+  mutate(proportion = n_sequential_tv / total) %>% 
+  knitr::kable()
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+#EDA by TR severity
+tr_model_df =
+  #empi_full %>% 
+  tr_filtered %>% 
+  select(empi, tr_cat, age, creatinine, egfr, tbili, albumin, inr, hemoglobin, platelet, meld, lved, lves, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, rv_fac, la_volume_index, ra_volume_index, tv_annular_area, vc_avg, tr_pisa_eroa, doppler_eroa, pasp, papm_echo, lvot_sv, rvot_sv, pvr_echo, ra_mean, ra_v_wave, paps, papd, papm, pcwp_mean, tpg, fick_co, fick_ci, stroke_volume, pvr, tapse_pasp, tapse_paps, sprime_pasp, sprime_paps, fac_pasp, fac_paps, papi) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf)))
+
+tr_model_df %>% ##test normality (Shapiro-Wilk)
+  select(-empi, -tr_cat) %>% 
+  map(~shapiro.test(.x)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "tr_cat") %>% 
+  knitr::kable()
+
+tr_model_df %>% 
+  select(tr_cat, rv_tapse, ra_mean, ra_v_wave, pcwp_mean) %>% 
+  group_by(tr_cat) %>% 
+  summarise(across(rv_tapse:pcwp_mean, list(mean = ~ mean(.x, na.rm = TRUE), sd = ~ sd(.x, na.rm = TRUE)))) %>%
+  pander::pandoc.table(style = "grid", caption = "Variables by TR severity, parametric")
+
+tr_model_df %>% 
+  select(-empi, -ra_mean, -ra_v_wave, -rv_tapse, -pcwp_mean) %>% 
+  group_by(tr_cat) %>% 
+  summarise(across(age:papi, list(median = ~ median(.x, na.rm = TRUE), Q1=~quantile(.x, probs = 0.25, na.rm = TRUE), Q3=~quantile(.x, probs = 0.75, na.rm = TRUE)))) %>% 
+  pander::pandoc.table(style = "grid", caption = "Variables by TR severity, nonparametric")
+
+tr_model_df %>% 
+  #drop_na(pvr) %>% 
+  group_by(tr_cat) %>% 
+  summarise(
+    n = n()
+  )
+
+tr_model_df %>% ##univariable analysis anova - use this one
+  select(ra_mean, ra_v_wave, rv_tapse, pcwp_mean) %>% 
+  map(~oneway.test(.x ~ tr_model_df$tr_cat, data = tr_model_df)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "tr_cat") %>% 
+  knitr::kable()
+
+tr_model_df %>% ##univariable analysis kruskal-wallis
+  select(-empi, -ra_mean, -ra_v_wave, -rv_tapse, -pcwp_mean, -tr_cat) %>% 
+  map(~kruskal.test(.x ~ tr_model_df$tr_cat, data = tr_model_df)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "tr_cat") %>% 
+  knitr::kable()
+```
+
+```{r}
+#multinomial regression, medical v transcatheter v surgical therapy
+library(nnet)
+
+empi_multinomial =
+empi_full %>% 
+  mutate(
+    tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL),
+    #aortic_stenosis = tolower(aortic_stenosis),
+    #mitral_regurg = tolower(mitral_regurg),
+    #aortic_stenosis = if_else(str_detect(empi_full$aortic_stenosis, "moderate|moderate to severe|severe|critical"), 1, 0, 0),
+    #mitral_regurg = if_else(str_detect(empi_full$mitral_regurg, "Moderate|Moderate to severe|Severe"), 1, 0, 0),
+    #left_valve = if_else(aortic_stenosis==1|mitral_regurg==1, 1, 0, 0),
+    #re_op = if_else(cabg == 1| aortic == 1|mitral == 1|mitral == 2|tricuspid == 1|tricuspid == 2, 1, 0, 0),
+    type_intervention = case_when(type_intervention==1 ~ 2, type_intervention==2 ~ 1, #switched valued for risk score ORs TTVI vs surgery 
+                                  #type_intervention !=1 | type_intervention!=2 ~ 0
+                                  ), 
+    type_intervention = as_factor(type_intervention)
+    )
+
+empi_multinomial %>% 
+  group_by(type_intervention) %>% 
+  summarise(n = n())
+  
+empi_multinomial %>% ##univariable analysis
+  select(age, left_valve, aortic_stenosis, mitral_regurg, re_op, nyha, hx_hfh, tr_cat, vc_avg, tr_pisa_eroa, doppler_eroa, creatinine, egfr, tbili, albumin, inr, hemoglobin, platelet, lved, lves, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, rv_fac, la_volume_index, ra_volume_index, tv_annular_area, pasp, ra_mean, ra_v_wave, paps, papd, papm, pcwp_mean, fick_co, fick_ci, stroke_volume, pvr, tapse_pasp, tapse_paps, sprime_pasp, sprime_paps, papi, tvs_risk, es2, triscore, meld, meld_xi, meld_albumin) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf))) %>% 
+  mutate(
+    tvs_risk = tvs_risk*10,
+    es2 = es2 * 10,
+    triscore = triscore *10
+  ) %>% 
+  map(~multinom(empi_multinomial$type_intervention ~ .x, data = empi_multinomial)) %>% 
+  map(broom::tidy) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  filter(term != "(Intercept)") %>% 
+  mutate(
+    OR = exp(estimate),
+    OR_CI_upper = exp(estimate + 1.96 * std.error),
+    OR_CI_lower = exp(estimate - 1.96 * std.error)
+  ) %>% 
+  select(name, y.level, OR, OR_CI_lower, OR_CI_upper, p.value) %>% 
+  pivot_wider(
+    names_from = "y.level",
+    values_from = c("OR", "OR_CI_lower", "OR_CI_upper", "p.value") 
+  ) %>%
+  select(name, OR_1, OR_CI_lower_1, OR_CI_upper_1, p.value_1
+         #, OR_2, OR_CI_lower_2, OR_CI_upper_2, p.value_2
+         ) %>% view()
+
+```
+
+```{r, include = FALSE, message = FALSE, warning = FALSE}
+# Visualization
+empi_full %>% 
+  ggplot(aes(x = age)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = sodium)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = creatinine)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = egfr)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = albumin)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = tbili)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = alk_phos)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = ast)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = alt)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = inr)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = hemoglobin)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = platelet)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = meld)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = lved)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = lves)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = lvef_calc)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = rv_base)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = rv_mid)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = rv_tapse)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = rv_fac)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = rv_tdi)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = la_volume_index)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = ra_volume_index)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = tv_annular_area)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = pasp)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = ra_mean)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = ra_v_wave)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = paps)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = papd)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = papm)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = pcwp_mean)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = fick_co)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = fick_ci)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = stroke_volume)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = pvr)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = tapse_pasp)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = tapse_paps)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = sprime_pasp)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = sprime_paps)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = fac_pasp)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = fac_paps)) + 
+  geom_histogram()
+
+empi_full %>% 
+  ggplot(aes(x = papi)) + 
+  geom_histogram()
+
+#empi_full %>% 
+ # group_by(tricuspid_regurg) %>% 
+  #filter(tricuspid_regurg != "significant", tricuspid_regurg != "trace", tricuspid_regurg != "mild", tricuspid_regurg != "mild to moderate") %>% 
+  #summarise(
+  #  n = n(),
+  #  mean_rv_base = mean(rv_base, na.rm = TRUE),
+  #  mean_rv_mid = mean(rv_mid, na.rm = TRUE),
+  #  median_tv_annular_area = median(tv_annular_area, na.rm = TRUE),
+  #  mean_tapse = mean(rv_tapse, na.rm = TRUE),
+  #  mean_rv_tdi = mean(rv_tdi, na.rm= TRUE),
+  #  mean_ra_mean = mean(ra_mean, na.rm = TRUE),
+  #  median_paps = median(paps, na.rm = TRUE),
+  #  median_papd = median(papd, na.rm = TRUE),
+  #  mean_pvr = mean(pvr, na.rm = TRUE)
+  #) %>% 
+  #knitr::kable()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = creatinine)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = egfr)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = tbili)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = alk_phos)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = albumin)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = inr)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = platelet)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = meld)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = lved)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = lves)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = lvef_calc)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = rv_base)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = rv_mid)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = la_volume_index)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = ra_volume_index)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = tv_annular_area)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = rv_tapse)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = rv_tdi)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = rv_fac)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = pasp)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = ra_mean)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = ra_a_wave)) +
+  geom_boxplot()
+
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = ra_v_wave)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = paps)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = papd)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = papm)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = pcwp_mean)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = fick_co)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = fick_ci)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = stroke_volume)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = pvr)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = tapse_pasp)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = tapse_paps)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = sprime_pasp)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = sprime_paps)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = fac_pasp)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = fac_paps)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = papi)) +
+  geom_boxplot()
+
+tr_filtered %>% 
+  ggplot(aes(x = ra_mean, y = meld)) +
+  geom_point()
+
+tr_filtered %>% 
+  ggplot(aes(x = sprime_pasp, y = meld)) +
+  geom_point()
+
+```
+
+```{r, include=FALSE}
+#Figures (abstract)
+rv_base_fig =
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = rv_base, fill=tr_cat)) +
+  geom_boxplot() +
+    labs(
+    #title = "Shock Classification, Valve Repair vs. Replacement",
+    y = "RV diameter, base (cm)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+  
+rv_base_fig
+
+ra_volume_fig = 
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = ra_volume_index)) +
+  geom_boxplot()
+
+ra_volume_fig
+
+rv_tdi_fig = 
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = rv_tdi, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "RV S' (cm/s)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+rv_tdi_fig
+
+ra_mean_fig =
+tr_filtered %>%  
+  ggplot(aes(x = tr_cat, y = ra_mean, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "RA mean pressure (mmHg)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+ra_mean_fig
+
+pasp_fig = 
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = pasp, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "PASP (mmHg)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+pasp_fig
+
+sprime_pasp_fig =
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = sprime_pasp, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "S'/PASP",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+sprime_pasp_fig
+
+papi_fig = 
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = papi, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "PAPi",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+papi_fig
+
+paps_fig = 
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = paps, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "PASP, invasive (mmHg)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+paps_fig
+
+rvsv_fig = 
+tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = rvot_sv, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "RV SV (cc)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+rvsv_fig
+
+ra_peak_fig = 
+  tr_filtered %>% 
+  ggplot(aes(x = tr_cat, y = ra_v_wave, fill=tr_cat)) +
+  geom_boxplot() +
+  labs(
+    y = "RA peak pressure (mmHg)",
+    x = ""
+  ) +
+  theme(axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), axis.text.x=element_blank()) +
+  scale_fill_brewer(palette="Blues", name = "TR severity", labels = c("≤Moderate", "Severe", "Massive", "Torrential"))
+
+ra_peak_fig 
+
+#(ra_volume_fig + rv_base_fig) / (ra_v_wave_fig + paps_fig) / (rv_tdi_fig + sprime_paps_fig)
+
+combined = (rv_base_fig + rv_tdi_fig) / (pasp_fig + rvsv_fig) / (ra_mean_fig + ra_peak_fig) + plot_layout(guides = "collect") & theme(legend.position="bottom")
+
+combined
+ggsave("tr_strat.jpg", combined, width = 8, height = 10)
+```
+
+```{r, include=FALSE, message = FALSE, warning = FALSE}
+#Modeling
+lm(meld ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(rv_base ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(rv_tapse ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(rv_tdi ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(rv_fac ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(ra_volume_index ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(tv_annular_area ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(ra_mean ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(ra_v_wave ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(paps ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(papd ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(pcwp_mean ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(fick_ci ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(pvr ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(tapse_paps ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(sprime_paps ~ tr_cat, data=tr_filtered) %>% 
+  broom::tidy()
+
+lm(papi ~ tr_cat, data=tr_model_df) %>% 
+  broom::tidy()
+
+###
+
+lm(meld ~ ra_mean, data=tr_filtered) %>% 
+  broom::glance()
+  
+lm(meld ~ ra_v_wave, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ rv_base, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ rv_mid, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ rv_tapse, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ rv_tdi, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ ra_volume_index, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ tapse_paps, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ sprime_paps, data=tr_filtered) %>% 
+  broom::glance()
+
+lm(meld ~ papi, data=tr_model_df) %>% 
+  broom::glance()
+
+mv_model_full = 
+lm(meld ~ tr_cat + rv_base + ra_volume_index + rv_tapse + ra_v_wave, data=tr_filtered)
+
+mv_model_full %>% 
+  broom::glance()
+
+mv_model_full %>% 
+  broom::tidy()
+
+mv_model_reduced = 
+lm(meld ~ rv_base + ra_volume_index + ra_v_wave, data=tr_filtered) 
+
+mv_model_reduced %>% 
+  broom::glance()
+
+mv_model_reduced %>% 
+  broom::tidy()
+
+#anova(mv_model_reduced, mv_model_full) %>% 
+#broom::tidy()
+
+#olsrr::ols_vif_tol(mv_model_reduced)
+```
+
+```{r}
+empi_full %>% 
+  summarise(
+    Q1 = quantile(ra_mean, probs = 0.25, na.rm = TRUE),
+    median = median(ra_mean, na.rm = TRUE),
+    Q3 = quantile(ra_mean, probs = 0.75, na.rm = TRUE)
+  )
+
+empi_full %>% 
+  summarise(
+    T1 = quantile(ra_mean, probs = 0.33, na.rm = TRUE),
+    T2 = quantile(ra_mean, probs = 0.66, na.rm = TRUE)
+  )
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+survival_df = #censoring for tricuspid proc
+empi_full %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf))) %>% 
+  mutate(
+    tricuspid_intervention = if_else(tricuspid_intervention == 1, 1, 0, 0),
+    composite = case_when(hfh == 1|death == 1 & tricuspid_intervention == 1 & date_hfh<date_intervention|date_death<date_intervention ~ 1, hfh == 1|death == 1 & tricuspid_intervention == 0 ~ 1, TRUE ~ 0),
+    composite_date = case_when(composite == 1 ~ pmin(date_hfh, date_death, na.rm=TRUE), composite != 1 ~ pmin(date_intervention, last_alive, na.rm=TRUE)),
+    os_months = as.duration(visit_date %--% composite_date) / dmonths(1),
+    tr_severe = if_else(tr_cat == "severe", 1, 0, missing=NULL),
+    tr_massive = if_else(tr_cat == "massive", 1, 0, missing=NULL),
+    tr_torrential = if_else(tr_cat == "torrential", 1, 0, missing=NULL),
+    tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL)
+  )
+
+survival_df %>% 
+  group_by(composite) %>% 
+  summarise(n())
+
+survival_df %>% 
+  select(mrn, empi, os_months) %>% 
+  filter(is.na(os_months))
+
+surv_object = Surv(time = survival_df$os_months, event = survival_df$composite)
+
+summary(surv_object)
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+#Survival DFs
+survival_df = #censoring for any proc #sensitivity analysis
+empi_full %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf))) %>% 
+  mutate(
+    any_proc = if_else(any_proc == 1, 1, 0, 0),
+    composite = case_when(hfh == 1|death == 1 & any_proc == 1 & date_hfh<any_proc_date|date_death<any_proc_date ~ 1, hfh == 1|death == 1 & any_proc == 0 ~ 1, TRUE ~ 0),
+    composite_date = case_when(composite == 1 ~ pmin(date_hfh, date_death, na.rm=TRUE), composite != 1 ~ pmin(any_proc_date, last_alive, na.rm=TRUE)),
+    os_months = as.duration(visit_date %--% composite_date) / dmonths(1),
+    tr_severe = if_else(tr_cat == "severe", 1, 0, missing=NULL),
+    tr_massive = if_else(tr_cat == "massive", 1, 0, missing=NULL),
+    tr_torrential = if_else(tr_cat == "torrential", 1, 0, missing=NULL),
+    tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL)
+  )
+
+empi_full %>% 
+  filter(other_proc_valve==1 & tricuspid_intervention==0) %>% 
+  count()
+```
+
+#ROC AUC for RAP
+
+```{r}
+library(survivalROC)
+## Define a helper function to evaluate at various t
+survivalROC_helper <- function(t) {
+    survivalROC(Stime        = survival_df$os_months,
+                status       = survival_df$composite,
+                marker       = survival_df$ra_mean,
+                predict.time = t,
+                method       = "NNE",
+                span = 0.25 * nrow(survival_df)^(-0.20))
+}
+## Evaluate every 30 days
+survivalROC_data <- data_frame(t = 30 * c(1,2,3,4,5,6)) %>%
+    mutate(survivalROC = map(t, survivalROC_helper),
+           ## Extract scalar AUC
+           auc = map_dbl(survivalROC, magrittr::extract2, "AUC"),
+           ## Put cut off dependent values in a data_frame
+           df_survivalROC = map(survivalROC, function(obj) {
+               as_data_frame(obj[c("cut.values","TP","FP")])
+           })) %>%
+    dplyr::select(-survivalROC) %>%
+    unnest() %>%
+    arrange(t, FP, TP)
+## Plot
+survivalROC_data %>%
+    ggplot(mapping = aes(x = FP, y = TP)) +
+    geom_point() +
+    geom_line() +
+    geom_label(data = survivalROC_data %>% dplyr::select(t,auc) %>% unique,
+               mapping = aes(label = sprintf("%.3f", auc)), x = 0.3, y = 0.5) +
+    #facet_wrap( ~ t) +
+    #theme_bw() +
+  labs(
+    title = "") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+          legend.key = element_blank(),
+          plot.title = element_text(hjust = 0.5),
+          strip.background = element_blank())
+```
+
+```{r}
+ROC.rap<-survivalROC(Stime = survival_df$os_months,
+                    status = survival_df$composite,
+                    marker = survival_df$ra_mean,
+                    predict.time = 90,
+                    method = "NNE",
+                    span = 0.25 * nrow(survival_df)^(-0.20))
+
+ROC.rap$cut.values[which.max(ROC.rap$TP-ROC.rap$FP)]
+
+ROC.rap[["AUC"]]
+
+ROC.rap=
+ROC.rap %>% 
+  as_tibble() 
+
+ROC.rap %>% 
+    ggplot(mapping = aes(x = FP, y = TP)) +
+    geom_point() +
+    geom_line() +
+    geom_label(data = ROC.rap %>% dplyr::select(AUC) %>% unique,
+               mapping = aes(label = sprintf("%.3f", AUC)), x = 0.5, y = 0.5) +
+    #facet_wrap( ~ t) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+          legend.key = element_blank(),
+          plot.title = element_text(hjust = 0.5),
+          strip.background = element_blank())
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+##Cox PH - univariable
+survival_df %>%
+  select(tr_cat, tr_severe, tr_massive, tr_torrential, vc_avg, tr_pisa_eroa, doppler_eroa, nyha, hx_hfh, meld, lved, lves, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, rv_fac, la_volume_index, ra_volume_index, pasp, left_valve, ra_mean, ra_v_wave, paps, papm, tpg, pvr, tapse_pasp, tapse_paps, sprime_pasp, sprime_paps, fac_pasp, fac_paps, papi) %>% 
+  map(~coxph(surv_object ~ .x, data = survival_df)) %>% 
+  map(broom::tidy) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  mutate(
+    HR = exp(estimate),
+    HR_CI_upper = exp(estimate + 1.96 * std.error),
+    HR_CI_lower = exp(estimate - 1.96 * std.error)
+  ) %>% 
+  select(name, HR, HR_CI_lower, HR_CI_upper, p.value) %>%
+  knitr::kable()
+```
+
+```{r}
+#survival analysis with mice (MI and Wald test)
+library(mice)
+
+data = 
+survival_df %>%
+  select(tr_cat, nyha, hx_hfh, meld, rv_mid, rv_tdi, ra_volume_index, ra_mean, ra_v_wave, sprime_pasp, papi)
+
+skimr::skim(data)
+md.pattern(data)
+
+surv_object = Surv(time = survival_df$os_months, event = survival_df$composite)
+
+imp <- mice(data, m = 100, seed = 1, print = FALSE)
+plot(imp)
+scope <- list(upper = ~ tr_cat + nyha + hx_hfh + rv_mid + rv_tdi + ra_volume_index + meld + ra_mean + sprime_pasp + ra_v_wave + papi, lower = ~1) #+ sprime_paps
+expr <- expression(f1 <- coxph(surv_object ~ 1),
+                   f2 <- step(f1, scope = scope, direction = "both"))
+
+fit <- with(imp, expr)
+#vif(fit)
+summary(fit)
+pool_fit = pool(fit)
+pool_fit
+summary(pool_fit)
+
+formulas <- lapply(fit$analyses, formula)
+terms <- lapply(formulas, terms)
+votes <- unlist(lapply(terms, labels))
+table(votes)
+
+fit.without = with(imp, coxph(surv_object ~ hx_hfh + nyha + ra_mean))
+fit.with = with(imp, coxph(surv_object ~ hx_hfh + nyha + rv_tdi + ra_mean))
+D1(fit.with, fit.without)
+
+summary(fit.without)
+pool_fit.without = pool(fit.without)
+
+pooled_mi_coef =
+summary(pool_fit.without) %>% 
+  as_tibble()
+
+pooled_mi_coef %>% 
+    mutate(
+    HR = exp(estimate),
+    HR_CI_upper = exp(estimate + 1.96 * std.error),
+    HR_CI_lower = exp(estimate - 1.96 * std.error)
+  ) %>% 
+  select(term, HR, HR_CI_lower, HR_CI_upper, p.value) %>% 
+  knitr::kable()
+```
+
+```{r}
+##cvp km curve
+cvp_surv = survfit(surv_object ~ cvp_tert, data = survival_df)
+
+cvp_km =
+ggsurvplot(cvp_surv, data = survival_df, risk.table = TRUE, pval = TRUE, test.for.trend = TRUE, xlim = c(0,24), break.x.by = 12, xlab = "Time, months", title = "Freedom from death or heart failure hospitalization", legend.title = "RAP, mean", legend.labs = c("T1: <=10mmHg", "T2: 10-15mmHg", "T3: >15mmHg"))
+#font.title = "bold", font.legend = "bold", font.x = "bold", font.y = "bold", font.tickslab = "bold", font.main="bold", font.submain="bold", font.caption="bold"
+cvp_km
+
+#cvp_km =
+#ggsurvplot(cvp_surv, data = survival_df, risk.table = TRUE, pval = TRUE, xlim = c(0,30), xlab = "Time, #months", legend.title = "CVP", legend.labs = c("Low: <13mmHg", "High: >13mmHg"))
+#cvp_km
+
+ggsave(file = "cvp_km.jpeg", print(cvp_km))
+```
